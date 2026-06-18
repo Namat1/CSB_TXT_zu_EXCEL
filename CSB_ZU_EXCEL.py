@@ -4,7 +4,7 @@ import io
 import re
 import traceback
 from copy import copy
-from typing import Dict, Tuple
+from typing import Dict, Tuple, List
 
 import pandas as pd
 import streamlit as st
@@ -51,7 +51,7 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
-st.title("🚚 CSB Textdatei Auswertung")
+st.title("🚚 CSB Textdatei Auswertung mit Diagnose")
 st.caption("Nur CSB Textdatei hochladen, Touren und Kunden prüfen und als Excel-Datei exportieren.")
 st.info(
     "CSB mit 103/F8 für die ganzen Wochentage von 1001-1886 bis 6001-6886 generieren "
@@ -165,26 +165,42 @@ def decode_txt_bytes(data: bytes) -> str:
 # CSB Textdatei lesen
 # ------------------------------------------------------------
 
-def extract_customer_line(line: str):
+def analyze_customer_line(line: str):
+    """
+    Gibt zurück:
+    - ("OK", tuple_mit_kundendaten)
+    - ("GRUND", None), wenn die Zeile nicht als Kunde erkannt wurde
+
+    Bewusst etwas toleranter als die erste Version:
+    Die Punkt-Spalten am Ende werden nicht mehr zwingend verlangt.
+    """
     raw = line.rstrip("\r\n").replace("\xa0", " ")
 
-    # Kundenzeilen enden im Ausdruck mit mehreren Punkt-Spalten.
-    if not re.search(r"(?:\.\s*){2,}\s*$", raw):
-        return None
+    if not raw.strip():
+        return "Leerzeile", None
 
-    # Unterstützt zum Beispiel:
+    # Kopf-, Trenn- und Summenzeilen ignorieren
+    if re.search(r"\b(Tour|Wochentag|Fahrer|Anzahl Kunden|LKW|Datum|Seite)\b", raw, re.IGNORECASE):
+        return "Kopf-/Summenzeile", None
+
+    # Kundenzeile muss im Regelfall eine 3- bis 6-stellige CSB Nummer am Anfang haben.
+    # Unterstützt:
     #          10502 Kunde ...
     #     1    13822 Kunde ...
-    match_start = re.match(r"^\s{3,}(?:(\d{1,3})\s+)?(\d{3,6})\s+", raw)
+    # Außerdem toleranter, falls weniger führende Leerzeichen vorhanden sind.
+    match_start = re.match(r"^\s*(?:(\d{1,3})\s+)?(\d{3,6})\s+", raw)
     if not match_start:
-        return None
+        # Nur kundenähnliche Zeilen in die Diagnose aufnehmen.
+        if re.search(r"\d{3,6}", raw) and re.search(r"[A-Za-zÄÖÜäöüß]", raw):
+            return "Keine passende CSB Nummer am Zeilenanfang", None
+        return "Keine Kundenzeile", None
 
     ladereihenfolge_aus_textdatei = match_start.group(1) or ""
     csb = match_start.group(2)
 
     plz_matches = list(re.finditer(r"\b\d{5}\b", raw))
     if not plz_matches:
-        return None
+        return "Keine fünfstellige Postleitzahl gefunden", None
 
     plz_match = plz_matches[-1]
     plz = plz_match.group(0)
@@ -195,14 +211,24 @@ def extract_customer_line(line: str):
 
     mid = raw[match_start.end():plz_match.start()].rstrip()
 
+    if not clean_text(mid):
+        return "Kein Kundenname / keine Straße zwischen CSB und Postleitzahl", None
+
     # CSB Festbreite: Name ungefähr 21 Zeichen, danach Straße.
     kunde = clean_text(mid[:21])
     strasse = clean_text(mid[21:])
 
-    return ladereihenfolge_aus_textdatei, csb, kunde, strasse, plz, ort
+    return "OK", (ladereihenfolge_aus_textdatei, csb, kunde, strasse, plz, ort)
 
 
-def parse_csb_ladeplan(text: str) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+def extract_customer_line(line: str):
+    status, customer = analyze_customer_line(line)
+    if status == "OK":
+        return customer
+    return None
+
+
+def parse_csb_ladeplan(text: str) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     current_tour = ""
     current_wochentag_raw = ""
     current_liefertag = ""
@@ -210,6 +236,7 @@ def parse_csb_ladeplan(text: str) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFr
     position = 0
 
     kunden_rows = []
+    nicht_erkannte_rows: List[dict] = []
     tour_meta: Dict[str, dict] = {}
 
     tour_re = re.compile(r"^\s*Tour\s+(\d{3,6})\b(.*?)(?:LKW:|$)", re.IGNORECASE)
@@ -257,8 +284,8 @@ def parse_csb_ladeplan(text: str) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFr
             tour_meta[current_tour]["Erwartete Kunden"] = int(count_match.group(1))
             continue
 
-        customer = extract_customer_line(line)
-        if customer and current_tour:
+        status, customer = analyze_customer_line(line)
+        if status == "OK" and customer and current_tour:
             position += 1
             ladereihenfolge_aus_textdatei, csb, kunde, strasse, plz, ort = customer
 
@@ -275,6 +302,15 @@ def parse_csb_ladeplan(text: str) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFr
                     "Postleitzahl": norm_num(plz),
                     "Ort": ort,
                     "Tour Text": current_tour_text,
+                }
+            )
+        elif current_tour and status not in ("Leerzeile", "Kopf-/Summenzeile", "Keine Kundenzeile"):
+            nicht_erkannte_rows.append(
+                {
+                    "Tour": current_tour,
+                    "Liefertag": current_liefertag,
+                    "Grund": status,
+                    "Originalzeile": line,
                 }
             )
 
@@ -296,7 +332,7 @@ def parse_csb_ladeplan(text: str) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFr
         empty_pruefung = pd.DataFrame(
             columns=["Tour", "Liefertag", "Erwartete Kunden", "Erkannte Kunden", "Differenz", "Status"]
         )
-        return kunden_df, empty_touren, empty_pruefung
+        return kunden_df, empty_touren, empty_pruefung, pd.DataFrame(nicht_erkannte_rows)
 
     erkannte = (
         kunden_df.groupby("Tour", as_index=False)
@@ -326,7 +362,9 @@ def parse_csb_ladeplan(text: str) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFr
         ["Tour", "Liefertag", "Erwartete Kunden", "Erkannte Kunden", "Differenz", "Status"]
     ].copy()
 
-    return kunden_df, touren_df, pruefung_df
+    nicht_erkannte_df = pd.DataFrame(nicht_erkannte_rows)
+
+    return kunden_df, touren_df, pruefung_df, nicht_erkannte_df
 
 
 # ------------------------------------------------------------
@@ -379,6 +417,7 @@ def build_excel_export(
     pruefung_df: pd.DataFrame,
     tagesuebersicht_df: pd.DataFrame,
     doppelte_kunden_df: pd.DataFrame,
+    nicht_erkannte_df: pd.DataFrame,
 ) -> bytes:
     output = io.BytesIO()
 
@@ -391,6 +430,7 @@ def build_excel_export(
         auffaellige_touren_df.to_excel(writer, sheet_name="Auffällige Touren", index=False)
         tagesuebersicht_df.to_excel(writer, sheet_name="Tagesübersicht", index=False)
         doppelte_kunden_df.to_excel(writer, sheet_name="Doppelte Kunden", index=False)
+        nicht_erkannte_df.to_excel(writer, sheet_name="Nicht erkannte Zeilen", index=False)
 
         workbook = writer.book
         header_fill = PatternFill(fill_type="solid", fgColor="1F2937")
@@ -434,7 +474,7 @@ if uploaded_txt is None:
 try:
     with st.spinner("Textdatei wird gelesen und ausgewertet..."):
         txt_text = decode_txt_bytes(uploaded_txt.getvalue())
-        csb_kunden_df, csb_touren_df, csb_pruefung_df = parse_csb_ladeplan(txt_text)
+        csb_kunden_df, csb_touren_df, csb_pruefung_df, nicht_erkannte_df = parse_csb_ladeplan(txt_text)
         tagesuebersicht_df = build_tagesuebersicht(csb_kunden_df, csb_touren_df)
         doppelte_kunden_df = build_doppelte_kunden(csb_kunden_df)
 
@@ -460,12 +500,16 @@ try:
     else:
         st.warning("Es gibt Touren mit abweichender Kundenzahl oder ohne gefundene Sollzahl.")
 
+    if not nicht_erkannte_df.empty:
+        st.info(f"Es wurden {len(nicht_erkannte_df)} kundenähnliche Zeilen nicht übernommen. Details stehen im Reiter „Nicht erkannte Zeilen“ und im Excel-Export.")
+
     excel_bytes = build_excel_export(
         csb_kunden_df,
         csb_touren_df,
         csb_pruefung_df,
         tagesuebersicht_df,
         doppelte_kunden_df,
+        nicht_erkannte_df,
     )
 
     st.download_button(
@@ -506,13 +550,14 @@ try:
             mask = mask | gefiltert_df[spalte].astype(str).str.contains(pattern, case=False, na=False)
         gefiltert_df = gefiltert_df[mask]
 
-    tab1, tab2, tab3, tab4, tab5 = st.tabs(
+    tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs(
         [
             "Kunden aus Textdatei",
             "Touren Prüfung",
             "Auffällige Touren",
             "Tagesübersicht",
             "Doppelte Kunden",
+            "Nicht erkannte Zeilen",
         ]
     )
 
@@ -537,6 +582,13 @@ try:
             st.success("Keine doppelten Kunden je Liefertag gefunden.")
         else:
             show_dataframe(doppelte_kunden_df)
+
+    with tab6:
+        st.caption("Diese Zeilen sahen kundenähnlich aus, konnten aber nicht sauber als Kunde gelesen werden.")
+        if nicht_erkannte_df.empty:
+            st.success("Keine kundenähnlichen Zeilen übersprungen.")
+        else:
+            show_dataframe(nicht_erkannte_df)
 
 except Exception:
     st.error("Fehler beim Verarbeiten der Textdatei.")
