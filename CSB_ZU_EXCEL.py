@@ -17,12 +17,13 @@ st.set_page_config(
 
 st.title("🚚 CSB Textdatei Tourzuordnung")
 st.caption(
-    "Auswertung aus der CSB Textdatei. Schwerpunkt: CSB Nummer, Kundenname, Tour und Liefertag."
+    "Auswertung aus der CSB Textdatei. Schwerpunkt: Tour, Liefertag, Kundenname und CSB Nummer. "
+    "Zeilen mit ????? werden ebenfalls der aktuellen Tour zugeordnet, CSB bleibt dann leer."
 )
 
 st.info(
     "CSB Textdatei hochladen. Die App liest je Tourblock die Kundenzeilen aus "
-    "und erstellt eine Excel-Datei mit der Tourzuordnung."
+    "und erstellt eine Excel-Datei mit farblich gruppierten Tour-Endungen."
 )
 
 
@@ -37,6 +38,22 @@ WOCHENTAG_MAP = {
 }
 
 TAG_REIHENFOLGE = ["Mo", "Die", "Mitt", "Don", "Fr", "Sam", "So"]
+
+# Dezente Farben für gleiche Tour-Endungen, zum Beispiel 1999, 2999, 3999.
+ENDUNG_FARBEN = [
+    "FFF2CC",
+    "D9EAD3",
+    "D9EAF7",
+    "EADCF8",
+    "FCE4D6",
+    "DDEBF7",
+    "E2F0D9",
+    "F4CCCC",
+    "D9D2E9",
+    "CFE2F3",
+    "EADFCB",
+    "E6F2E6",
+]
 
 
 def clean_text(value) -> str:
@@ -64,6 +81,13 @@ def norm_num(value) -> str:
 
 def norm_tour(value) -> str:
     return norm_num(value)
+
+
+def tour_endung(tour: str) -> str:
+    tour = norm_tour(tour)
+    if len(tour) >= 3 and tour.isdigit():
+        return tour[-3:]
+    return tour
 
 
 def normalize_day(value: str) -> str:
@@ -110,11 +134,13 @@ def decode_txt_bytes(data: bytes) -> str:
 
 def extract_customer_core(line: str):
     """
-    Liest nur die wichtigste Information:
-    CSB Nummer und Kundenname.
+    Liest die wichtigste Information:
+    - CSB Nummer, wenn vorhanden
+    - Kundenname
+    - Platzhalter-Zeilen mit ????? werden auch als Kunde übernommen,
+      CSB Nummer bleibt dann leer.
 
     Bewusst nicht abhängig von Postleitzahl, Straße oder Punktspalten.
-    Wenn vorne keine echte CSB Nummer erkannt wird, wird die Zeile ignoriert.
     """
     original = line.rstrip("\r\n").replace("\xa0", " ")
 
@@ -132,18 +158,26 @@ def extract_customer_core(line: str):
     ):
         return None
 
-    # Wichtig:
-    # Es wird nur am Zeilenanfang gesucht, weil dort in der CSB Kundenzeile
-    # optional die Ladereihenfolge und danach die CSB Nummer stehen.
-    match = re.match(r"^\s*(?:(\d{1,3})\s+)?(\d{3,6})\s+(.*)$", original)
+    # Normale Kundenzeile:
+    #   16968 Signature Foods ...
+    #   1 13822 Kunde ...
+    #
+    # Sonderfall:
+    #   ????? FABRIKVERKAUF FR. CE Am Heisterbusch ...
+    #
+    # Wichtig ist die Tourzuordnung. Bei ????? bleibt CSB leer.
+    match = re.match(r"^\s*(?:(\d{1,3})\s+)?(?:(\d{3,6})|(\?{3,}))\s+(.*)$", original)
     if not match:
         return None
 
     ladereihenfolge = match.group(1) or ""
-    csb = norm_num(match.group(2))
-    rest = clean_text(match.group(3))
+    csb_roh = match.group(2) or ""
+    platzhalter = match.group(3) or ""
+    rest = clean_text(match.group(4))
 
-    if not csb or not rest:
+    csb = norm_num(csb_roh) if csb_roh else ""
+
+    if not rest:
         return None
 
     # Punktspalten am Ende entfernen.
@@ -153,7 +187,7 @@ def extract_customer_core(line: str):
     # Adresse und Ort sind zweitrangig.
     name_basis = rest
 
-    # Wenn eine Ortsangabe am Ende erkannt wird, entfernen.
+    # Ortsangabe am Ende entfernen.
     # Unterstützt deutsche und ausländische Postleitzahlen wie A-4890 und NL-7580.
     location_match = re.search(
         r"\b(?:[A-Z]{1,3}-)?\d{4,5}\s+[A-ZÄÖÜa-zäöüß][A-ZÄÖÜa-zäöüß0-9 .\-/]*$",
@@ -162,7 +196,7 @@ def extract_customer_core(line: str):
     if location_match:
         name_basis = name_basis[:location_match.start()].rstrip()
 
-    # Danach bekannte Straßenmuster entfernen, damit nur der Kundenname bleibt.
+    # Bekannte Straßenmuster entfernen, damit nur der Kundenname bleibt.
     street_match = re.search(
         r"\b("
         r"[A-ZÄÖÜa-zäöüß0-9.\-/]+(?:straße|strasse|str\.|str|weg|allee|damm|ring|platz|chaussee)"
@@ -185,17 +219,17 @@ def extract_customer_core(line: str):
         if parts:
             name = parts[0]
         else:
-            # Letzter Fallback: maximal die ersten 32 Zeichen als Name nehmen.
-            name = clean_text(name_basis[:32])
+            # Letzter Fallback: maximal die ersten 40 Zeichen als Name nehmen.
+            name = clean_text(name_basis[:40])
 
-    # Sicherheitsnetz: Name darf nicht leer sein.
     if not name:
-        name = clean_text(rest[:32])
+        name = clean_text(rest[:40])
 
     return {
         "Ladereihenfolge aus Textdatei": ladereihenfolge,
         "CSB Nummer": csb,
         "Kunde": name,
+        "CSB Platzhalter": "ja" if platzhalter else "",
         "Originalzeile": clean_text(original),
     }
 
@@ -242,6 +276,7 @@ def parse_csb_text(text: str) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]
 
             tour_meta[current_tour] = {
                 "Tour": current_tour,
+                "Tour Endung": tour_endung(current_tour),
                 "Liefertag": current_day,
                 "Wochentag aus Textdatei": current_day_raw,
                 "Tour Text": current_tour_text,
@@ -255,6 +290,7 @@ def parse_csb_text(text: str) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]
                 current_tour,
                 {
                     "Tour": current_tour,
+                    "Tour Endung": tour_endung(current_tour),
                     "Liefertag": current_day,
                     "Wochentag aus Textdatei": current_day_raw,
                     "Tour Text": current_tour_text,
@@ -270,11 +306,13 @@ def parse_csb_text(text: str) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]
             rows.append(
                 {
                     "Tour": current_tour,
+                    "Tour Endung": tour_endung(current_tour),
                     "Liefertag": current_day,
                     "Position im Tourblock": position,
                     "Ladereihenfolge aus Textdatei": customer["Ladereihenfolge aus Textdatei"],
                     "CSB Nummer": customer["CSB Nummer"],
                     "Kunde": customer["Kunde"],
+                    "CSB Platzhalter": customer["CSB Platzhalter"],
                     "Tour Text": current_tour_text,
                     "Wochentag aus Textdatei": current_day_raw,
                     "Originalzeile": customer["Originalzeile"],
@@ -287,6 +325,7 @@ def parse_csb_text(text: str) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]
         empty_touren = pd.DataFrame(
             columns=[
                 "Tour",
+                "Tour Endung",
                 "Liefertag",
                 "Wochentag aus Textdatei",
                 "Tour Text",
@@ -327,22 +366,29 @@ def parse_csb_text(text: str) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]
 
     touren_df["Status"] = touren_df.apply(build_status, axis=1)
 
-    doppelt_df = (
-        kunden_df.groupby(["Liefertag", "CSB Nummer"], as_index=False)
-        .agg(
-            Kunde=("Kunde", "first"),
-            Anzahl_Touren=("Tour", "nunique"),
-            Touren=("Tour", lambda values: ", ".join(sorted(set(map(str, values))))),
+    # Doppelte nur für echte CSB Nummern prüfen. Platzhalter ohne CSB werden ignoriert.
+    kunden_mit_csb = kunden_df[kunden_df["CSB Nummer"].astype(str).str.strip() != ""].copy()
+    if kunden_mit_csb.empty:
+        doppelt_df = pd.DataFrame(
+            columns=["Liefertag", "CSB Nummer", "Kunde", "Anzahl Touren", "Touren"]
         )
-    )
-    doppelt_df = doppelt_df[doppelt_df["Anzahl_Touren"] > 1].copy()
-    doppelt_df = doppelt_df.rename(columns={"Anzahl_Touren": "Anzahl Touren"})
+    else:
+        doppelt_df = (
+            kunden_mit_csb.groupby(["Liefertag", "CSB Nummer"], as_index=False)
+            .agg(
+                Kunde=("Kunde", "first"),
+                Anzahl_Touren=("Tour", "nunique"),
+                Touren=("Tour", lambda values: ", ".join(sorted(set(map(str, values))))),
+            )
+        )
+        doppelt_df = doppelt_df[doppelt_df["Anzahl_Touren"] > 1].copy()
+        doppelt_df = doppelt_df.rename(columns={"Anzahl_Touren": "Anzahl Touren"})
 
     kunden_df = kunden_df.sort_values(
-        ["Liefertag", "Tour", "Position im Tourblock"], kind="stable"
+        ["Tour Endung", "Liefertag", "Tour", "Position im Tourblock"], kind="stable"
     ).reset_index(drop=True)
 
-    touren_df = touren_df.sort_values(["Liefertag", "Tour"], kind="stable").reset_index(drop=True)
+    touren_df = touren_df.sort_values(["Tour Endung", "Liefertag", "Tour"], kind="stable").reset_index(drop=True)
 
     if not doppelt_df.empty:
         doppelt_df = doppelt_df.sort_values(
@@ -352,12 +398,21 @@ def parse_csb_text(text: str) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]
     return kunden_df, touren_df, doppelt_df
 
 
+def make_color_map(endungen: List[str]) -> Dict[str, str]:
+    unique_endungen = sorted({clean_text(e) for e in endungen if clean_text(e)})
+    return {
+        endung: ENDUNG_FARBEN[index % len(ENDUNG_FARBEN)]
+        for index, endung in enumerate(unique_endungen)
+    }
+
+
 def make_excel_export(
     kunden_df: pd.DataFrame,
     touren_df: pd.DataFrame,
     doppelt_df: pd.DataFrame,
 ) -> bytes:
     output = io.BytesIO()
+    color_map = make_color_map(kunden_df["Tour Endung"].astype(str).tolist()) if not kunden_df.empty else {}
 
     with pd.ExcelWriter(output, engine="openpyxl") as writer:
         kunden_df.to_excel(writer, sheet_name="Tourzuordnung", index=False)
@@ -369,14 +424,16 @@ def make_excel_export(
             tages_df = (
                 kunden_df.groupby("Liefertag", as_index=False)
                 .agg(
-                    Anzahl_Lieferungen=("CSB Nummer", "count"),
-                    Anzahl_Kunden=("CSB Nummer", "nunique"),
+                    Anzahl_Lieferungen=("Kunde", "count"),
+                    Anzahl_Kunden_mit_CSB=("CSB Nummer", lambda values: sum(1 for value in values if str(value).strip())),
+                    Anzahl_Platzhalter=("CSB Platzhalter", lambda values: sum(1 for value in values if str(value).strip())),
                     Anzahl_Touren=("Tour", "nunique"),
                 )
                 .rename(
                     columns={
                         "Anzahl_Lieferungen": "Anzahl Lieferungen",
-                        "Anzahl_Kunden": "Anzahl Kunden",
+                        "Anzahl_Kunden_mit_CSB": "Anzahl Kunden mit CSB",
+                        "Anzahl_Platzhalter": "Anzahl Platzhalter ohne CSB",
                         "Anzahl_Touren": "Anzahl Touren",
                     }
                 )
@@ -409,6 +466,19 @@ def make_excel_export(
                 cell.fill = copy(header_fill)
                 cell.alignment = copy(header_alignment)
 
+            # Farblich nach Tour-Endung markieren.
+            if worksheet.title in ("Tourzuordnung", "Touren Prüfung"):
+                header_names = [cell.value for cell in worksheet[1]]
+                if "Tour Endung" in header_names:
+                    endung_col = header_names.index("Tour Endung") + 1
+                    for row in range(2, worksheet.max_row + 1):
+                        endung = clean_text(worksheet.cell(row=row, column=endung_col).value)
+                        color = color_map.get(endung)
+                        if color:
+                            fill = PatternFill(fill_type="solid", fgColor=color)
+                            for col in range(1, worksheet.max_column + 1):
+                                worksheet.cell(row=row, column=col).fill = fill
+
             for column in worksheet.columns:
                 column_letter = column[0].column_letter
                 max_length = 0
@@ -420,8 +490,27 @@ def make_excel_export(
     return output.getvalue()
 
 
-def show_dataframe(df: pd.DataFrame):
-    st.dataframe(df, use_container_width=True, hide_index=True)
+def style_by_tour_endung(df: pd.DataFrame):
+    if df.empty or "Tour Endung" not in df.columns:
+        return df
+
+    color_map = make_color_map(df["Tour Endung"].astype(str).tolist())
+
+    def apply_row(row):
+        endung = clean_text(row.get("Tour Endung", ""))
+        color = color_map.get(endung)
+        if not color:
+            return [""] * len(row)
+        return [f"background-color: #{color}" for _ in row]
+
+    return df.style.apply(apply_row, axis=1)
+
+
+def show_dataframe(df: pd.DataFrame, farbig: bool = False):
+    if farbig:
+        st.dataframe(style_by_tour_endung(df), use_container_width=True, hide_index=True)
+    else:
+        st.dataframe(df, use_container_width=True, hide_index=True)
 
 
 uploaded_txt = st.file_uploader("CSB Textdatei hochladen", type=["txt"])
@@ -435,17 +524,22 @@ try:
         kunden_df, touren_df, doppelt_df = parse_csb_text(txt_text)
 
     if kunden_df.empty:
-        st.error("Es wurden keine Kundenzeilen mit CSB Nummer erkannt.")
+        st.error("Es wurden keine Kundenzeilen oder Platzhalter-Zeilen erkannt.")
         st.stop()
 
     auffaellige_touren = int((touren_df["Status"] != "OK").sum()) if not touren_df.empty else 0
+    platzhalter_anzahl = int((kunden_df["CSB Platzhalter"].astype(str).str.strip() != "").sum())
+    kunden_mit_csb = int((kunden_df["CSB Nummer"].astype(str).str.strip() != "").sum())
 
     col1, col2, col3, col4, col5 = st.columns(5)
     col1.metric("Lieferungen", f"{len(kunden_df):,}".replace(",", "."))
-    col2.metric("Kunden", f"{kunden_df['CSB Nummer'].nunique():,}".replace(",", "."))
-    col3.metric("Touren", f"{kunden_df['Tour'].nunique():,}".replace(",", "."))
-    col4.metric("Auffällige Touren", f"{auffaellige_touren:,}".replace(",", "."))
-    col5.metric("Doppelte je Tag", f"{len(doppelt_df):,}".replace(",", "."))
+    col2.metric("mit CSB", f"{kunden_mit_csb:,}".replace(",", "."))
+    col3.metric("ohne CSB", f"{platzhalter_anzahl:,}".replace(",", "."))
+    col4.metric("Touren", f"{kunden_df['Tour'].nunique():,}".replace(",", "."))
+    col5.metric("Auffällige Touren", f"{auffaellige_touren:,}".replace(",", "."))
+
+    if platzhalter_anzahl:
+        st.info(f"{platzhalter_anzahl} Zeilen mit ????? wurden der jeweiligen Tour zugeordnet. Die CSB Nummer bleibt leer.")
 
     if auffaellige_touren == 0:
         st.success("Die ausgelesene Kundenzahl passt bei allen Touren zur Sollzahl aus der Textdatei.")
@@ -472,18 +566,33 @@ try:
     )
 
     with tab1:
-        st.caption("Wichtigste Auswertung: Tour, Liefertag, CSB Nummer und Kundenname.")
-        show_dataframe(kunden_df[["Tour", "Liefertag", "Position im Tourblock", "CSB Nummer", "Kunde", "Originalzeile"]])
+        st.caption(
+            "Wichtigste Auswertung: Tour, Tour-Endung, Liefertag, CSB Nummer und Kundenname. "
+            "Gleiche Tour-Endungen sind farblich gleich markiert."
+        )
+        view_df = kunden_df[
+            [
+                "Tour",
+                "Tour Endung",
+                "Liefertag",
+                "Position im Tourblock",
+                "CSB Nummer",
+                "Kunde",
+                "CSB Platzhalter",
+                "Originalzeile",
+            ]
+        ].copy()
+        show_dataframe(view_df, farbig=True)
 
     with tab2:
-        show_dataframe(touren_df)
+        show_dataframe(touren_df, farbig=True)
 
     with tab3:
         auffaellig_df = touren_df[touren_df["Status"] != "OK"].copy()
         if auffaellig_df.empty:
             st.success("Keine auffälligen Touren gefunden.")
         else:
-            show_dataframe(auffaellig_df)
+            show_dataframe(auffaellig_df, farbig=True)
 
     with tab4:
         if doppelt_df.empty:
