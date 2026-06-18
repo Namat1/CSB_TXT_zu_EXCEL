@@ -18,7 +18,7 @@ st.set_page_config(
 st.title("🚚 CSB Textdatei Tourzuordnung")
 st.caption(
     "Auswertung aus der CSB Textdatei. Schwerpunkt: Tour, Liefertag, Kundenname und CSB Nummer. "
-    "Zeilen mit ????? werden ebenfalls der aktuellen Tour zugeordnet, CSB bleibt dann leer."
+    "Zeilen mit ????? werden ebenfalls der aktuellen Tour zugeordnet, CSB bleibt dann leer. Kundennamen wie TEST KUNDENNUMMER werden nicht mehr als Kopfzeile verworfen."
 )
 
 st.info(
@@ -148,14 +148,33 @@ def extract_customer_core(line: str):
         return None
 
     # Kopfzeilen, Summenzeilen und technische Druckzeilen nicht auswerten.
-    if re.search(
-        r"\b("
-        r"Tour|Wochentag|Fahrer|Anzahl Kunden|LKW|Datum|Druckdatum|Seite|"
-        r"Rolli Rückgabe|Rolli Rueckgabe|Kunden-Nr|Kundennummer"
-        r")\b",
-        original,
-        re.IGNORECASE,
-    ):
+    # Wichtig: Nicht einfach nach "Kundennummer" irgendwo in der Zeile suchen,
+    # weil es auch echte Kundennamen wie "TEST KUNDENNUMMER" geben kann.
+    stripped = original.strip()
+
+    header_patterns = [
+        r"^Tour\s",
+        r"^Tour-\s*/\s*Ladeplan",
+        r"^Wochentag\s",
+        r"^Fahrer\s*:",
+        r"^LKW\s*:",
+        r"^Tor\s*:",
+        r"^km Stand",
+        r"^Start Arbeitszeit",
+        r"^Ende Arbeitszeit",
+        r"^Druckdatum\s*:",
+        r"^!!!!!",
+        r"^La\.\s+Kunde",
+        r"^Pa\s+",
+        r"^von Zeit",
+        r"^bis\s*$",
+        r"^\d+\s+Anzahl Kunden\b",
+    ]
+
+    if any(re.search(pattern, stripped, re.IGNORECASE) for pattern in header_patterns):
+        return None
+
+    if "Rolli Rückgabe" in stripped or "Rolli Rueckgabe" in stripped:
         return None
 
     # Normale Kundenzeile:
