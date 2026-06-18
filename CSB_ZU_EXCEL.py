@@ -8,6 +8,12 @@ from typing import Dict, List, Tuple
 import pandas as pd
 import streamlit as st
 
+try:
+    from st_aggrid import AgGrid, GridOptionsBuilder, JsCode
+    AGGRID_AVAILABLE = True
+except Exception:
+    AGGRID_AVAILABLE = False
+
 
 st.set_page_config(
     page_title="CSB Textdatei Tourzuordnung",
@@ -327,13 +333,9 @@ def parse_csb_text(text: str) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]
                     "Tour": current_tour,
                     "Tour Endung": tour_endung(current_tour),
                     "Liefertag": current_day,
-                    "Position im Tourblock": position,
-                    "Ladereihenfolge aus Textdatei": customer["Ladereihenfolge aus Textdatei"],
                     "CSB Nummer": customer["CSB Nummer"],
                     "Kunde": customer["Kunde"],
-                    "CSB Platzhalter": customer["CSB Platzhalter"],
                     "Tour Text": current_tour_text,
-                    "Wochentag aus Textdatei": current_day_raw,
                     "Originalzeile": customer["Originalzeile"],
                 }
             )
@@ -346,7 +348,6 @@ def parse_csb_text(text: str) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]
                 "Tour",
                 "Tour Endung",
                 "Liefertag",
-                "Wochentag aus Textdatei",
                 "Tour Text",
                 "Soll Kunden laut Textdatei",
                 "Ausgelesene Kunden",
@@ -404,7 +405,7 @@ def parse_csb_text(text: str) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]
         doppelt_df = doppelt_df.rename(columns={"Anzahl_Touren": "Anzahl Touren"})
 
     kunden_df = kunden_df.sort_values(
-        ["Tour Endung", "Liefertag", "Tour", "Position im Tourblock"], kind="stable"
+        ["Tour Endung", "Liefertag", "Tour", "Kunde"], kind="stable"
     ).reset_index(drop=True)
 
     touren_df = touren_df.sort_values(["Tour Endung", "Liefertag", "Tour"], kind="stable").reset_index(drop=True)
@@ -445,14 +446,14 @@ def make_excel_export(
                 .agg(
                     Anzahl_Lieferungen=("Kunde", "count"),
                     Anzahl_Kunden_mit_CSB=("CSB Nummer", lambda values: sum(1 for value in values if str(value).strip())),
-                    Anzahl_Platzhalter=("CSB Platzhalter", lambda values: sum(1 for value in values if str(value).strip())),
+                    Anzahl_ohne_CSB=("CSB Nummer", lambda values: sum(1 for value in values if not str(value).strip())),
                     Anzahl_Touren=("Tour", "nunique"),
                 )
                 .rename(
                     columns={
                         "Anzahl_Lieferungen": "Anzahl Lieferungen",
                         "Anzahl_Kunden_mit_CSB": "Anzahl Kunden mit CSB",
-                        "Anzahl_Platzhalter": "Anzahl Platzhalter ohne CSB",
+                        "Anzahl_ohne_CSB": "Anzahl ohne CSB",
                         "Anzahl_Touren": "Anzahl Touren",
                     }
                 )
@@ -525,11 +526,91 @@ def style_by_tour_endung(df: pd.DataFrame):
     return df.style.apply(apply_row, axis=1)
 
 
-def show_dataframe(df: pd.DataFrame, farbig: bool = False):
-    if farbig:
-        st.dataframe(style_by_tour_endung(df), use_container_width=True, hide_index=True)
-    else:
+def show_grid(df: pd.DataFrame, farbig: bool = False, key: str = "grid"):
+    """
+    Interaktives Grid:
+    - sortieren
+    - filtern
+    - Spalten verschieben
+    - Spaltenbreite ändern
+    - Seitenleiste für Filter/Spalten
+
+    Falls streamlit-aggrid nicht installiert ist, wird automatisch st.dataframe genutzt.
+    """
+    if df.empty:
         st.dataframe(df, use_container_width=True, hide_index=True)
+        return
+
+    if not AGGRID_AVAILABLE:
+        if farbig:
+            st.dataframe(style_by_tour_endung(df), use_container_width=True, hide_index=True)
+        else:
+            st.dataframe(df, use_container_width=True, hide_index=True)
+        st.caption("Für das interaktive Grid bitte streamlit-aggrid installieren.")
+        return
+
+    grid_df = df.copy().fillna("")
+
+    builder = GridOptionsBuilder.from_dataframe(grid_df)
+    builder.configure_default_column(
+        sortable=True,
+        filter=True,
+        resizable=True,
+        wrapText=False,
+        autoHeight=False,
+    )
+    builder.configure_pagination(enabled=True, paginationAutoPageSize=False, paginationPageSize=100)
+    builder.configure_side_bar()
+    builder.configure_grid_options(
+        domLayout="normal",
+        rowSelection="multiple",
+        suppressRowClickSelection=False,
+        enableRangeSelection=True,
+    )
+
+    if "Originalzeile" in grid_df.columns:
+        builder.configure_column("Originalzeile", width=520)
+    if "Kunde" in grid_df.columns:
+        builder.configure_column("Kunde", width=260)
+    if "Tour Text" in grid_df.columns:
+        builder.configure_column("Tour Text", width=220)
+    if "CSB Nummer" in grid_df.columns:
+        builder.configure_column("CSB Nummer", width=120)
+    if "Tour" in grid_df.columns:
+        builder.configure_column("Tour", width=95)
+    if "Tour Endung" in grid_df.columns:
+        builder.configure_column("Tour Endung", width=115)
+    if "Liefertag" in grid_df.columns:
+        builder.configure_column("Liefertag", width=100)
+
+    grid_options = builder.build()
+
+    if farbig and "Tour Endung" in grid_df.columns:
+        color_map = make_color_map(grid_df["Tour Endung"].astype(str).tolist())
+        js_color_map = "{" + ",".join([f'"{key_}":"#{value}"' for key_, value in color_map.items()]) + "}"
+        grid_options["getRowStyle"] = JsCode(
+            f"""
+            function(params) {{
+                const colors = {js_color_map};
+                const endung = params.data["Tour Endung"];
+                if (colors[endung]) {{
+                    return {{ backgroundColor: colors[endung] }};
+                }}
+                return {{}};
+            }}
+            """
+        )
+
+    AgGrid(
+        grid_df,
+        gridOptions=grid_options,
+        height=720,
+        width="100%",
+        fit_columns_on_grid_load=False,
+        allow_unsafe_jscode=True,
+        theme="balham",
+        key=key,
+    )
 
 
 uploaded_txt = st.file_uploader("CSB Textdatei hochladen", type=["txt"])
@@ -547,7 +628,7 @@ try:
         st.stop()
 
     auffaellige_touren = int((touren_df["Status"] != "OK").sum()) if not touren_df.empty else 0
-    platzhalter_anzahl = int((kunden_df["CSB Platzhalter"].astype(str).str.strip() != "").sum())
+    platzhalter_anzahl = int((kunden_df["CSB Nummer"].astype(str).str.strip() == "").sum())
     kunden_mit_csb = int((kunden_df["CSB Nummer"].astype(str).str.strip() != "").sum())
 
     col1, col2, col3, col4, col5 = st.columns(5)
@@ -558,7 +639,7 @@ try:
     col5.metric("Auffällige Touren", f"{auffaellige_touren:,}".replace(",", "."))
 
     if platzhalter_anzahl:
-        st.info(f"{platzhalter_anzahl} Zeilen mit ????? wurden der jeweiligen Tour zugeordnet. Die CSB Nummer bleibt leer.")
+        st.info(f"{platzhalter_anzahl} Zeilen ohne CSB Nummer wurden der jeweiligen Tour zugeordnet.")
 
     if auffaellige_touren == 0:
         st.success("Die ausgelesene Kundenzahl passt bei allen Touren zur Sollzahl aus der Textdatei.")
@@ -587,37 +668,35 @@ try:
     with tab1:
         st.caption(
             "Wichtigste Auswertung: Tour, Tour-Endung, Liefertag, CSB Nummer und Kundenname. "
-            "Gleiche Tour-Endungen sind farblich gleich markiert."
+            "Gleiche Tour-Endungen sind farblich gleich markiert. Im Grid kannst du filtern und sortieren."
         )
         view_df = kunden_df[
             [
                 "Tour",
                 "Tour Endung",
                 "Liefertag",
-                "Position im Tourblock",
                 "CSB Nummer",
                 "Kunde",
-                "CSB Platzhalter",
                 "Originalzeile",
             ]
         ].copy()
-        show_dataframe(view_df, farbig=True)
+        show_grid(view_df, farbig=True, key="grid_tourzuordnung")
 
     with tab2:
-        show_dataframe(touren_df, farbig=True)
+        show_grid(touren_df, farbig=True, key="grid_touren_pruefung")
 
     with tab3:
         auffaellig_df = touren_df[touren_df["Status"] != "OK"].copy()
         if auffaellig_df.empty:
             st.success("Keine auffälligen Touren gefunden.")
         else:
-            show_dataframe(auffaellig_df, farbig=True)
+            show_grid(auffaellig_df, farbig=True, key="grid_auffaellige")
 
     with tab4:
         if doppelt_df.empty:
             st.success("Keine doppelten Kunden je Liefertag gefunden.")
         else:
-            show_dataframe(doppelt_df)
+            show_grid(doppelt_df, key="grid_doppelte")
 
 except Exception:
     st.error("Fehler beim Verarbeiten der Textdatei.")
